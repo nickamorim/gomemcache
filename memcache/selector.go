@@ -68,18 +68,26 @@ func (s *staticAddr) String() string  { return s.str }
 func (ss *ServerList) SetServers(servers ...string) error {
 	naddr := make([]net.Addr, len(servers))
 	for i, server := range servers {
-		if strings.Contains(server, "/") {
+		if strings.Contains(server, "unix://") {
 			addr, err := net.ResolveUnixAddr("unix", server)
 			if err != nil {
 				return err
 			}
 			naddr[i] = newStaticAddr(addr)
-		} else {
-			tcpaddr, err := net.ResolveTCPAddr("tcp", server)
+		} else if strings.Contains(server, "udp") {
+			udpaddr, err := net.ResolveUDPAddr("udp", strings.TrimPrefix(server, "udp://"))
+			if err != nil {
+				return err
+			}
+			naddr[i] = newStaticAddr(udpaddr)
+		} else if strings.Contains(server, "tcp") {
+			tcpaddr, err := net.ResolveTCPAddr("tcp", strings.TrimPrefix(server, "tcp://"))
 			if err != nil {
 				return err
 			}
 			naddr[i] = newStaticAddr(tcpaddr)
+		} else {
+			panic("invalid server address, must include protocol")
 		}
 	}
 

@@ -21,9 +21,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -126,7 +128,10 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return &Client{selector: ss}
+	return &Client{
+		selector:  ss,
+		requestId: uint16(rand.Intn(1 << 16)),
+	}
 }
 
 // Client is a memcache client.
@@ -156,6 +161,8 @@ type Client struct {
 
 	lk       sync.Mutex
 	freeconn map[string][]*conn
+
+	requestId uint16
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -380,15 +387,25 @@ func (c *Client) withKeyRw(key string, fn func(*bufio.ReadWriter) error) error {
 
 func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
+		var requestId uint16 = c.requestId
+		var sequenceNumber uint16 = 0
+		var totalDatagrams uint16 = 1 // requests are limited to 1 datagram
+		var reserved uint16 = 0
+		for _, v := range []uint16{requestId, sequenceNumber, totalDatagrams, reserved} {
+			if err := binary.Write(rw, binary.BigEndian, v); err != nil {
+				return err
+			}
+		}
 		if _, err := fmt.Fprintf(rw, "gets %s\r\n", strings.Join(keys, " ")); err != nil {
 			return err
 		}
 		if err := rw.Flush(); err != nil {
 			return err
 		}
-		if err := parseGetResponse(rw.Reader, cb); err != nil {
+		if err := parseGetResponse(rw.Reader, requestId, cb); err != nil {
 			return err
 		}
+		c.requestId++
 		return nil
 	})
 }
@@ -509,38 +526,68 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
-func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
+func parseGetResponse(r *bufio.Reader, requestId uint16, cb func(*Item)) error {
+	responseDatagrams := make(map[uint16][]byte)
+	var totalDatagrams uint16
+	var remainingDatagrams int
+
 	for {
-		line, err := r.ReadSlice('\n')
+		buf := make([]byte, 1400)
+		bytesRead, err := r.Read(buf)
 		if err != nil {
 			return err
 		}
+		if bytesRead < 8 {
+			return errors.New("Invalid UDP header received")
+		}
+
+		responseId := binary.BigEndian.Uint16(buf[0:2])
+		if requestId != responseId {
+			continue
+		}
+		sequenceNo := binary.BigEndian.Uint16(buf[2:4])
+		totalDatagrams = binary.BigEndian.Uint16(buf[4:6])
+		if remainingDatagrams == 0 {
+			remainingDatagrams = int(totalDatagrams)
+		}
+
+		responseDatagrams[sequenceNo] = buf[8:bytesRead]
+		remainingDatagrams--
+		if remainingDatagrams == 0 {
+			break
+		}
+	}
+
+	it := new(Item)
+	for i := uint16(0); i < totalDatagrams; i++ {
+		line := responseDatagrams[i]
 		if bytes.Equal(line, resultEnd) {
 			return nil
 		}
-		it := new(Item)
-		size, err := scanGetResponseLine(line, it)
+		size, remainder, err := scanGetResponseLine(line, it)
 		if err != nil {
 			return err
 		}
-		it.Value = make([]byte, size+2)
-		_, err = io.ReadFull(r, it.Value)
+		v := make([]byte, size+2)
+		lineReader := bytes.NewReader(remainder)
+		_, err = io.ReadFull(lineReader, v)
 		if err != nil {
 			it.Value = nil
 			return err
 		}
-		if !bytes.HasSuffix(it.Value, crlf) {
-			it.Value = nil
-			return fmt.Errorf("memcache: corrupt get result read")
+		it.Value = append(it.Value, v...)
+		if bytes.HasSuffix(it.Value, crlf) {
+			it.Value = it.Value[:len(it.Value)-len(crlf)]
+			cb(it)
+			it = new(Item)
 		}
-		it.Value = it.Value[:size]
-		cb(it)
 	}
+	return nil
 }
 
 // scanGetResponseLine populates it and returns the declared size of the item.
 // It does not read the bytes of the item.
-func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
+func scanGetResponseLine(line []byte, it *Item) (size int, remainingLine []byte, err error) {
 	pattern := "VALUE %s %d %d %d\r\n"
 	dest := []interface{}{&it.Key, &it.Flags, &size, &it.CasID}
 	if bytes.Count(line, space) == 3 {
@@ -549,9 +596,15 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 	}
 	n, err := fmt.Sscanf(string(line), pattern, dest...)
 	if err != nil || n != len(dest) {
-		return -1, fmt.Errorf("memcache: unexpected line in get response: %q", line)
+		return -1, nil, fmt.Errorf("memcache: unexpected line in get response: %q", line)
 	}
-	return size, nil
+
+	headerEnd := bytes.Index(line, crlf)
+	if headerEnd == -1 {
+		return -1, nil, fmt.Errorf("memcache: missing CRLF in get response: %q", line)
+	}
+
+	return size, line[headerEnd+len(crlf):], nil
 }
 
 // Set writes the given item, unconditionally.
@@ -622,6 +675,31 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 	if !legalKey(item.Key) {
 		return ErrMalformedKey
 	}
+
+	// 0-1 Request ID
+	// 2-3 Sequence number
+	// 4-5 Total number of datagrams in this message
+	// 6-7 Reserved for future use; must be 0
+
+	// The request ID is supplied by the client. Typically it will be a
+	// monotonically increasing value starting from a random seed, but the client
+	// is free to use whatever request IDs it likes. The server's response will
+	// contain the same ID as the incoming request. The client uses the request ID
+	// to differentiate between responses to outstanding requests if there are
+	// several pending from the same server; any datagrams with an unknown request
+	// ID are probably delayed responses to an earlier request and should be
+	// discarded.
+
+	var requestId uint16 = c.requestId
+	var sequenceNumber uint16 = 0
+	var totalDatagrams uint16 = 1 // requests are limited to 1 datagram
+	var reserved uint16 = 0
+	for _, v := range []uint16{requestId, sequenceNumber, totalDatagrams, reserved} {
+		if err := binary.Write(rw, binary.BigEndian, v); err != nil {
+			return err
+		}
+	}
+
 	var err error
 	if verb == "cas" {
 		_, err = fmt.Fprintf(rw, "%s %s %d %d %d %d\r\n",
