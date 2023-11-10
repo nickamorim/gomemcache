@@ -8,15 +8,17 @@ import (
 )
 
 func main() {
-	mc := memcache.New("udp://127.0.0.1:11211")
-	v := bytes.Repeat([]byte("a"), 1024*1)
-	// set keys foo-0 through foo-1000
-	for i := 0; i < 1000; i++ {
-		mc.Set(&memcache.Item{Key: fmt.Sprintf("foo-%d", i), Value: v})
+	mc := memcache.New("udp://127.0.0.1:12312")
+	v := bytes.Repeat([]byte("a"), 8*1024)
+	for i := 0; i < 1; i++ {
+		err := mc.Set(&memcache.Item{Key: fmt.Sprintf("bar-%d", i), Value: v})
+		if err != nil {
+			fmt.Println("set")
+			panic(err)
+		}
 	}
-	// get key foo-0 through foo-1000
-	for i := 0; i < 1000; i++ {
-		res, err := mc.Get(fmt.Sprintf("foo-%d", i))
+	for i := 0; i < 1; i++ {
+		res, err := mc.Get(fmt.Sprintf("bar-%d", i))
 		if err != nil {
 			fmt.Println("get")
 			panic(err)
@@ -27,5 +29,5 @@ func main() {
 			panic("value not equal")
 		}
 	}
-	println("success...")
+	fmt.Println("success...")
 }
