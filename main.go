@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/Shopify/gomemcache/memcache"
+	"github.com/nickamorim/gomemcache/memcache"
 )
 
 func main() {
@@ -24,8 +24,8 @@ func main() {
 			panic(err)
 		}
 		if string(v) != string(res.Value) {
-			fmt.Println("v: ", v)
-			fmt.Println("res.Value: ", res.Value)
+			fmt.Println("v: ", len(v))
+			fmt.Println("res.Value: ", len(res.Value))
 			panic("value not equal")
 		}
 	}

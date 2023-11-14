@@ -24,7 +24,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -524,41 +523,50 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
 func parseGetResponse(r *bufio.Reader, requestId uint16, cb func(*Item)) error {
-	var totalDatagrams uint16
+	// var totalDatagrams uint16
 	var expectedSequenceNo uint16
 
-	line := make([]byte, 0)
+	respBuf := make([]byte, 0)
 	for {
-		buf := make([]byte, 1400)
-		bytesRead, err := r.Read(buf)
-		if err != nil {
-			return err
-		}
-		if bytesRead < 8 {
-			return errors.New("Invalid UDP header received")
+		var line []byte
+		if len(respBuf) == 0 || respBuf[len(respBuf)-1] != '\n' {
+
+			buf := make([]byte, 1400)
+			bytesRead, err := r.Read(buf)
+			if err != nil {
+				return err
+			}
+			if bytesRead < 8 {
+				return errors.New("Invalid UDP header received")
+			}
+
+			responseId := binary.BigEndian.Uint16(buf[0:2])
+			if requestId != responseId {
+				return errors.New("request ID != response ID")
+				// continue
+			}
+			sequenceNo := binary.BigEndian.Uint16(buf[2:4])
+			// totalDatagrams = binary.BigEndian.Uint16(buf[4:6])
+
+			if sequenceNo != expectedSequenceNo {
+				return errors.New("Packet out of order")
+			}
+			expectedSequenceNo++
+
+			nl := bytes.IndexByte(buf[8:bytesRead], '\n')
+			if nl == -1 {
+				continue
+			}
+			// println("pre newline", "nl", nl, "bytesRead", bytesRead, "buf", string(buf), "respBuf", string(respBuf))
+			nl = len(respBuf) + nl
+			respBuf = append(respBuf, buf[8:bytesRead]...)
+			line = respBuf[:nl]
+			respBuf = respBuf[nl+1:]
+			// println("post trunc", "nl", nl, "bytesRead", bytesRead, "buf", string(buf), "respBuf", string(respBuf), "line", string(line))
+		} else {
+			line = respBuf
 		}
 
-		responseId := binary.BigEndian.Uint16(buf[0:2])
-		if requestId != responseId {
-			continue
-		}
-		sequenceNo := binary.BigEndian.Uint16(buf[2:4])
-		totalDatagrams = binary.BigEndian.Uint16(buf[4:6])
-
-		if sequenceNo != expectedSequenceNo {
-			return errors.New("Packet out of order")
-		}
-
-		line = append(line, buf[8:bytesRead]...)
-
-		expectedSequenceNo++
-		if expectedSequenceNo == totalDatagrams {
-			break
-		}
-	}
-	lineReader := bufio.NewReader(bytes.NewReader(line))
-	for {
-		line, err := lineReader.ReadSlice('\n')
 		if bytes.Equal(line, resultEnd) {
 			return nil
 		}
@@ -567,17 +575,29 @@ func parseGetResponse(r *bufio.Reader, requestId uint16, cb func(*Item)) error {
 		if err != nil {
 			return err
 		}
-		it.Value = make([]byte, size+2)
-		_, err = io.ReadFull(lineReader, it.Value)
-		if err != nil {
-			it.Value = nil
-			return err
+		for {
+			if len(respBuf) >= (size + 2) { // +2 for crlf
+				break
+			}
+			buf := make([]byte, 1400)
+			bytesRead, err := r.Read(buf)
+			if err != nil {
+				return err
+			}
+			if bytesRead < 8 {
+				return errors.New("Invalid UDP header received")
+			}
+			respBuf = append(respBuf, buf[8:bytesRead]...)
 		}
-		if !bytes.HasSuffix(it.Value, crlf) {
+		nl := bytes.IndexByte(respBuf, '\n')
+		if nl == -1 {
 			it.Value = nil
 			return fmt.Errorf("memcache: corrupt get result read")
 		}
-		it.Value = it.Value[:size]
+		it.Value = make([]byte, size)
+		it.Value = respBuf[:nl-1] // skip /r
+
+		respBuf = respBuf[nl+1:] // skip /n
 		cb(it)
 	}
 }
@@ -708,12 +728,9 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 	if _, err := rw.Write(crlf); err != nil {
 		return err
 	}
-	// print the length of the buffer
-	println("len(rw): ", rw.Writer.Buffered())
 	if err := rw.Flush(); err != nil {
 		return err
 	}
-	fmt.Println("flushed...")
 	line, err := rw.ReadSlice('\n')
 	if err != nil {
 		return err
